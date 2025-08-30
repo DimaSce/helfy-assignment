@@ -1,0 +1,164 @@
+version: '3.8'
+
+networks:
+  app-network:
+
+volumes:
+  ticdc-data:
+
+services:
+  # PD
+  pd:
+    image: pingcap/pd:v7.4.0
+    container_name: pd
+    ports:
+      - "2379:2379"
+    command:
+      - --name=pd
+      - --client-urls=http://0.0.0.0:2379
+      - --peer-urls=http://0.0.0.0:2380
+      - --advertise-client-urls=http://pd:2379
+      - --advertise-peer-urls=http://pd:2380
+      - --initial-cluster=pd=http://pd:2380
+    networks:
+      - app-network
+
+  # TiKV
+  tikv:
+    image: pingcap/tikv:v7.4.0
+    container_name: tikv
+    command:
+      - --addr=0.0.0.0:20160
+      - --advertise-addr=tikv:20160
+      - --data-dir=/data/tikv
+      - --pd=pd:2379
+    depends_on:
+      - pd
+    networks:
+      - app-network
+
+  # TiDB
+  tidb:
+    image: pingcap/tidb:v7.4.0
+    container_name: tidb
+    depends_on:
+      - pd
+      - tikv
+    ports:
+      - "4000:4000"
+    networks:
+      - app-network
+    command: ["tidb-server", "--store=tikv", "--path=pd:2379"]
+
+  # TiCDC
+  ticdc:
+    image: pingcap/ticdc:v7.4.0
+    container_name: ticdc
+    depends_on:
+      - pd
+      - tikv
+    networks:
+      - app-network
+    volumes:
+      - ticdc-data:/cdc-data
+    entrypoint: ["sh", "-c", "\
+      until curl -s http://pd:2379/pd/api/v1/members; do echo waiting for pd; sleep 2; done && \
+      /cdc server \
+        --pd=http://pd:2379 \
+        --addr=0.0.0.0:8300 \
+        --advertise-addr=ticdc:8300 \
+        --data-dir=/cdc-data \
+        --log-file=/dev/stdout \
+      "]
+    restart: always
+
+  # Zookeeper
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.2.15
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+    ports:
+      - "2181:2181"
+    networks:
+      - app-network
+
+  # Kafka
+  kafka:
+    image: confluentinc/cp-kafka:7.2.15
+    container_name: kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: true
+    networks:
+      - app-network
+
+  # Backend
+  backend:
+    build: ./backend
+    container_name: backend
+    depends_on:
+      - tidb
+      - kafka
+    networks:
+      - app-network
+    ports:
+      - "5000:4000"
+    environment:
+      DB_HOST: tidb
+      DB_PORT: 4000
+      DB_USER: root
+      DB_PASSWORD: ""
+      DB_NAME: testdb
+      KAFKA_BROKER: kafka:9092
+    restart: unless-stopped
+
+  # Frontend
+  frontend:
+    build: ../part1/frontend
+    container_name: frontend
+    networks:
+      - app-network
+    ports:
+      - "3000:80"
+
+  # CDC Consumer
+  cdc-consumer:
+    build: ./cdc-consumer
+    container_name: cdc-consumer
+    depends_on:
+      - kafka
+    networks:
+      - app-network
+    environment:
+      KAFKA_BROKER: kafka:9092
+    restart: unless-stopped
+
+  # MySQL client/init (optional, для создания таблиц)
+  mysql-init:
+    image: mysql:8.0
+    container_name: mysql-init
+    depends_on:
+      - tidb
+    networks:
+      - app-network
+    volumes:
+      - ../part2/init.sql:/docker-entrypoint-initdb.d/init.sql
+    command: >
+      sh -c "
+      echo 'Waiting for TiDB to be ready...';
+      until mysql -h tidb -P 4000 -u root -e 'select 1'; do
+        sleep 2;
+      done;
+      echo 'TiDB is ready, running init.sql';
+      cat /docker-entrypoint-initdb.d/init.sql | mysql -h tidb -P 4000 -u root
+      "
