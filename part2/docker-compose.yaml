@@ -1,0 +1,106 @@
+version: "3.9"
+
+networks:
+  app-network:
+    driver: bridge
+
+services:
+
+  tidb:
+    image: pingcap/tidb:v7.4.0
+    container_name: tidb
+    ports:
+      - "4000:4000"
+    networks:
+      - app-network
+
+  mysql-init:
+    image: mysql:8.0
+    container_name: mysql-init
+    depends_on:
+      - tidb
+    networks:
+      - app-network
+    volumes:
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    command: >
+      sh -c "
+      echo 'Waiting for TiDB to be ready...';
+      until mysql -h tidb -P 4000 -u root -e 'select 1'; do
+        sleep 2;
+      done;
+      echo 'TiDB is ready, running init.sql';
+      cat /docker-entrypoint-initdb.d/init.sql | mysql -h tidb -P 4000 -u root
+      "
+
+  backend:
+    build: ../part1/backend
+    container_name: backend
+    depends_on:
+      - tidb
+      - mysql-init
+      - kafka
+    networks:
+      - app-network
+    ports:
+      - "5000:4000"
+    environment:
+      DB_HOST: tidb
+      DB_PORT: 4000
+      DB_USER: root
+      DB_PASSWORD: ""
+      DB_NAME: testdb
+      KAFKA_BROKER: kafka:9092
+    restart: unless-stopped
+
+  frontend:
+    build: ../part1/frontend
+    container_name: frontend
+    depends_on:
+      - backend
+    networks:
+      - app-network
+    ports:
+      - "3000:80"
+
+  backend-kafka:
+    build: ./backend-kafka
+    container_name: backend-kafka
+    depends_on:
+      - kafka
+    networks:
+      - app-network
+    ports:
+      - "5001:5001"
+    environment:
+      KAFKA_BROKER: kafka:9092
+    restart: unless-stopped
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.2.15
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    networks:
+      - app-network
+    ports:
+      - "2181:2181"
+
+  kafka:
+    image: confluentinc/cp-kafka:7.2.15
+    container_name: kafka
+    depends_on:
+      - zookeeper
+    networks:
+      - app-network
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092
+    restart: unless-stopped
+
